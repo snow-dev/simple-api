@@ -7,13 +7,14 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"context"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"google.golang.org/grpc"
+
 	"os"
 	"os/signal"
 
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -76,8 +77,53 @@ func (s BlogServiceServer) ReadBlog(ctx context.Context, req *blogpb.ReadBlogReq
 	return response, nil
 }
 
-func (b BlogServiceServer) UpdateBlog(context.Context, *blogpb.UpdateBlogReq) (*blogpb.UpdateBlogRes, error) {
-	panic("implement me")
+func (s BlogServiceServer) UpdateBlog(ctx context.Context, req *blogpb.UpdateBlogReq) (*blogpb.UpdateBlogRes, error) {
+	// Get the blog data from the request.
+	blog := req.GetBlog()
+
+	//convert the Id string to a MongoDB ObjectId
+	oid, err := primitive.ObjectIDFromHex(blog.GetId())
+	if err != nil {
+		return nil, status.Errorf(
+			codes.InvalidArgument,
+			fmt.Sprintf("Could not convert the supplied blog id to a MongoDB ObjectId: %v", err),
+		)
+	}
+
+	// Convert the data to be updated into an unordered Bson document.
+	update := bson.M{
+		"author_id": blog.GetAuthorId(),
+		"title":     blog.GetTitle(),
+		"content":   blog.GetContent(),
+	}
+
+	// Convert the oid into an unordered bson document to search by id.
+	filter := bson.M{"_id": oid}
+
+	// Result is the BSON encoded result
+	// To return the updated document instead of original we have to add options.
+	result := blogdb.FindOneAndUpdate(ctx, filter, bson.M{"$set": update}, options.FindOneAndUpdate().SetReturnDocument(1))
+
+	// Decode result and write it to 'decoded'
+	decoded := BlogItem{}
+
+	err = result.Decode(&decoded)
+	if err != nil {
+		return nil, status.Errorf(
+			codes.NotFound,
+			fmt.Sprintf("Could not find blog with supplied ID: %v", err),
+		)
+	}
+
+	return &blogpb.UpdateBlogRes{
+		Blog: &blogpb.Blog{
+			Id:       decoded.ID.Hex(),
+			AuthorId: decoded.AuthorID,
+			Title:    decoded.Title,
+			Content:  decoded.Content,
+		},
+	}, nil
+
 }
 
 func (s BlogServiceServer) DeleteBlog(ctx context.Context, req *blogpb.DeleteBlogReq) (*blogpb.DeleteBlogRes, error) {
@@ -100,8 +146,44 @@ func (s BlogServiceServer) DeleteBlog(ctx context.Context, req *blogpb.DeleteBlo
 	}, nil
 }
 
-func (b BlogServiceServer) ListBlogs(*blogpb.ListBlogsReq, blogpb.BlogService_ListBlogsServer) error {
-	panic("implement me")
+func (s BlogServiceServer) ListBlogs(ctx *blogpb.ListBlogsReq, stream blogpb.BlogService_ListBlogsServer) error {
+	// Initiate a blog item type to write decoded data to
+	data := &BlogItem{}
+
+	// collection.Find returns a cursor for our (empty) query.
+	cursor, err := blogdb.Find(context.Background(), bson.M{})
+	if err != nil {
+		return status.Errorf(codes.Internal, fmt.Sprintf("Unknow internal error: %v", err))
+	}
+	// An expresion with defer will be called at the end of the function.
+	defer cursor.Close(context.Background())
+	//  cursor.Next() returns a boolean , it false there are not more items and loop will break.
+	for cursor.Next(context.Background()) {
+		// Decode the data at the current pointer and write it to data.
+		err := cursor.Decode(data)
+
+		if err != nil {
+			return status.Errorf(codes.Unavailable, fmt.Sprintf("Could not decode data: %v", err))
+		}
+
+		// If no error is found send blog over stream.
+		stream.Send(&blogpb.ListBlogsRes{
+			Blog: &blogpb.Blog{
+				Id:       data.ID.Hex(),
+				AuthorId: data.AuthorID,
+				Title:    data.Title,
+				Content:  data.Content,
+			},
+		})
+	}
+
+	// Check if the cursor has any errors.
+	if err := cursor.Err(); err != nil {
+		return status.Errorf(codes.Internal, fmt.Sprintf("Unknow cursor error: %v", err))
+	}
+
+	return nil
+
 }
 
 var db *mongo.Client
@@ -156,7 +238,7 @@ func main() {
 		fmt.Println("Connected to Mongodb")
 	}
 
-	blogdb = db.Database("mydb").Collection("blog")
+	blogdb = db.Database("test").Collection("blog")
 
 	// Start the server in a child routine
 	go func() {
@@ -164,7 +246,7 @@ func main() {
 			log.Fatalf("Failed to serve: %v", err)
 		}
 	}()
-	fmt.Println("Server succesfully started on port :50051")
+	fmt.Println("Server successfully started on port :50051")
 
 	// Bad way to stop the server
 	// if err := s.Serve(listener); err != nil {
